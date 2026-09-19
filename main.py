@@ -370,13 +370,18 @@ class App(ttk.Frame):
         app_secret = self.app_secret.get().strip()
         user_token = self.user_token.get().strip()
 
-        def work() -> tuple[TokenExchangeResult, list[FacebookPage]]:
+        def work() -> tuple[TokenExchangeResult, list[FacebookPage], str | None]:
             exchanged = exchange_user_token(app_id, app_secret, user_token)
-            pages = fetch_all_pages(exchanged.access_token)
-            return exchanged, pages
+            pages_error: str | None = None
+            pages: list[FacebookPage] = []
+            try:
+                pages = fetch_all_pages(exchanged.access_token)
+            except MetaAPIError as exc:
+                pages_error = exc.format_for_user()
+            return exchanged, pages, pages_error
 
         def ok(result: object) -> None:
-            exchanged, pages = result  # type: ignore[misc]
+            exchanged, pages, pages_error = result  # type: ignore[misc]
             assert isinstance(exchanged, TokenExchangeResult)
             assert isinstance(pages, list)
 
@@ -395,7 +400,30 @@ class App(ttk.Frame):
             )
             self._set_readonly_entry(self.ll_token, exchanged.access_token)
             self._populate_pages(pages)
-            self._set_status(f"Loaded {len(pages)} Facebook Page(s).")
+
+            if pages_error:
+                self._set_status("Long-lived token OK — Page list failed.")
+                messagebox.showwarning(
+                    "Pages not loaded",
+                    "Long-lived User Access Token was generated and is shown above.\n\n"
+                    "Listing Facebook Pages failed:\n\n"
+                    + pages_error
+                    + "\n\nAdd pages_show_list to the User Token and try again, "
+                    "or use Graph API Explorer with Pages selected.",
+                )
+            elif not pages:
+                self._set_status("Long-lived token OK — no Pages returned.")
+                messagebox.showwarning(
+                    "No Pages found",
+                    "Long-lived User Access Token was generated.\n\n"
+                    "Meta returned no Pages for /me/accounts.\n\n"
+                    "Check:\n"
+                    "• Permission pages_show_list\n"
+                    "• You are admin/editor of at least one Page\n"
+                    "• In Graph API Explorer, select the Pages you manage when creating the token",
+                )
+            else:
+                self._set_status(f"Loaded {len(pages)} Facebook Page(s).")
 
         self._run_async(
             work,

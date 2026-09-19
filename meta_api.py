@@ -107,10 +107,24 @@ def _parse_meta_error_payload(payload: dict[str, Any]) -> MetaAPIError:
     )
 
     hint = ""
-    if code_i == 190:
+    msg_l = message.lower()
+
+    if code_i == 190 or "session has expired" in msg_l or "invalid oauth" in msg_l:
         hint = (
-            "\n\nHint: The user access token is invalid or expired. "
-            "Generate a fresh User Access Token in the Meta developer tools."
+            "\n\nHint: The User Access Token is invalid or expired.\n"
+            "• Generate a fresh token in Graph API Explorer\n"
+            "• Choose “User Token” (not Page Token)\n"
+            "• Use the same Meta App as App ID / App Secret below"
+        )
+    elif "client secret" in msg_l or "app secret" in msg_l:
+        hint = (
+            "\n\nHint: App Secret does not match this App ID. "
+            "Copy App Secret again from Meta App → Settings → Basic."
+        )
+    elif "application" in msg_l and ("match" in msg_l or "belong" in msg_l or "validating" in msg_l):
+        hint = (
+            "\n\nHint: This Access Token was issued for a different Meta App. "
+            "App ID / App Secret must be from the same app that created the token."
         )
     elif code_i == 200:
         hint = (
@@ -120,8 +134,15 @@ def _parse_meta_error_payload(payload: dict[str, Any]) -> MetaAPIError:
     elif code_i == 10:
         hint = "\n\nHint: Permission denied for this operation on the Page or app."
     elif code_i == 100:
-        hint = "\n\nHint: Invalid parameter — check App ID and request fields."
-
+        hint = (
+            "\n\nHint: Invalid parameter — check App ID, App Secret, and that the "
+            "token is a User Access Token (not a Page Access Token)."
+        )
+    elif code_i == 1:
+        hint = (
+            "\n\nHint: Meta returned a generic error. Often this means App ID/Secret "
+            "mismatch or a Page token used instead of a User token."
+        )
     return MetaAPIError(
         message + hint,
         code=code_i,
@@ -200,6 +221,30 @@ def graph_request(
     return payload
 
 
+def inspect_input_token(app_id: str, app_secret: str, input_token: str) -> dict[str, Any]:
+    """
+    Call ``/debug_token`` (no secrets logged). Returns the ``data`` object.
+    Used to catch Page tokens / wrong-app tokens before exchange.
+    """
+    app_id = app_id.strip()
+    app_secret = app_secret.strip()
+    input_token = input_token.strip()
+    # App access token form: APP_ID|APP_SECRET (passed only via params).
+    app_token = f"{app_id}|{app_secret}"
+    payload = graph_request(
+        "GET",
+        "/debug_token",
+        params={
+            "input_token": input_token,
+            "access_token": app_token,
+        },
+    )
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        raise MetaAPIError("Could not inspect the Access Token (unexpected debug_token response).")
+    return data
+
+
 def exchange_user_token(
     app_id: str,
     app_secret: str,
@@ -217,6 +262,46 @@ def exchange_user_token(
     if not short_lived_user_token:
         raise MetaAPIError("User Access Token is required.")
 
+    # Pre-check: reject Page tokens / wrong app early with a clear message.
+    try:
+        info = inspect_input_token(app_id, app_secret, short_lived_user_token)
+    except MetaAPIError:
+        # If debug_token itself fails (bad secret etc.), continue to exchange —
+        # exchange will return the underlying Meta error.
+        info = None
+
+    if info is not None:
+        token_type = str(info.get("type") or "").upper()
+        app_id_from_token = str(info.get("app_id") or "")
+        is_valid = info.get("is_valid")
+
+        if is_valid is False:
+            err = info.get("error")
+            detail = ""
+            if isinstance(err, dict) and err.get("message"):
+                detail = f"\n\nMeta says: {_redact_for_safety(str(err.get('message')))}"
+            raise MetaAPIError(
+                "This Access Token is not valid (expired or revoked)."
+                + detail
+                + "\n\nGenerate a new User Access Token in Graph API Explorer."
+            )
+
+        if token_type == "PAGE":
+            raise MetaAPIError(
+                "You pasted a Page Access Token.\n\n"
+                "This step needs a User Access Token.\n"
+                "In Graph API Explorer set the token type to User Token "
+                "(not a Page), then copy that token here."
+            )
+
+        if app_id_from_token and app_id_from_token != app_id:
+            raise MetaAPIError(
+                "This Access Token belongs to a different Meta App.\n\n"
+                f"Token app_id: {app_id_from_token}\n"
+                f"You entered App ID: {app_id}\n\n"
+                "Use App ID + App Secret from the same app that issued the token."
+            )
+
     payload = graph_request(
         "GET",
         "/oauth/access_token",
@@ -232,7 +317,7 @@ def exchange_user_token(
     if not token or not isinstance(token, str):
         raise MetaAPIError("Token exchange succeeded but no access_token was returned.")
 
-    token_type = str(payload.get("token_type") or "bearer")
+    token_type_out = str(payload.get("token_type") or "bearer")
     expires_raw = payload.get("expires_in")
     expires_in: int | None
     if isinstance(expires_raw, int):
@@ -244,7 +329,7 @@ def exchange_user_token(
 
     return TokenExchangeResult(
         access_token=token,
-        token_type=token_type,
+        token_type=token_type_out,
         expires_in=expires_in,
     )
 
@@ -310,15 +395,7 @@ def fetch_all_pages(long_lived_user_token: str) -> list[FacebookPage]:
             if isinstance(nxt, str) and nxt.startswith("https://"):
                 next_url = nxt
 
-    if not pages:
-        raise MetaAPIError(
-            "No Facebook Pages were returned for this user token.\n\n"
-            "Possible causes:\n"
-            "• Missing pages_show_list permission\n"
-            "• The user is not an admin/editor of any Page\n"
-            "• The token was not generated with Page access selected"
-        )
-
+    # Empty list is OK — the GUI shows a warning. Long-lived token may still be usable.
     return pages
 
 
