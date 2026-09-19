@@ -92,10 +92,7 @@ Logs include HTTP status, sanitized params, and Meta JSON errors. **Full secrets
 11. Optionally **Test Token** / **Test Last 3 Posts** (`published_posts`).
 12. Paste into the plugin as: `PAGE_ID|PAGE_ACCESS_TOKEN`.
 
-### Token naming
-
-- **Long-Lived User Access Token** — intermediate only (used to call `/me/accounts`).
-- **Page Access Token** — from `/me/accounts` → `data[].access_token` — **this goes into the plugin**.
+### Permissions
 
 Grant permissions legally through Meta’s normal flows (App Review / Business Verification when required). This app does not bypass Meta’s permission system.
 
@@ -113,8 +110,8 @@ Optionally, depending on what you do with the token elsewhere:
 
 ### Token naming
 
-- **Long-Lived User Access Token** — exchanged from a short-lived user token (often ~60 days; see `expires_in` in the UI).
-- **Page Access Token** — obtained from `/me/accounts` for a Page you can manage.
+- **Long-Lived User Access Token** — intermediate only (used to call `/me/accounts`; often ~60 days).
+- **Page Access Token** — from `/me/accounts` → `data[].access_token` — **this goes into the plugin**.
 
 Meta may invalidate access tokens when permissions, passwords, security settings, app access, Page access, or other account conditions change. Do not treat Page tokens as unconditionally permanent.
 
