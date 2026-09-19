@@ -29,3 +29,6 @@ build/
 secrets/
 tokens.txt
 *.token
+
+# Runtime diagnostics (may still contain masked secrets — keep local)
+logs/

@@ -1,22 +1,26 @@
 #!/usr/bin/env python3
 """
-Meta Page Token Generator — macOS desktop GUI.
+Meta Page Token Generator — desktop GUI (macOS / Windows).
 
 Convert a Meta User Access Token to a long-lived token and retrieve Page Access Tokens.
-HTTP work runs in background threads; secrets are never printed to the terminal.
+HTTP work runs in background threads; secrets are never printed or logged in full.
 """
 
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
 import threading
 import webbrowser
 from typing import Callable
 
 import tkinter as tk
-from tkinter import messagebox, ttk
+from tkinter import messagebox, scrolledtext, ttk
 
 from meta_api import (
     GRAPH_API_VERSION,
+    DiagnosticReport,
     FacebookPage,
     MetaAPIError,
     PagePost,
@@ -24,8 +28,13 @@ from meta_api import (
     exchange_user_token,
     fetch_all_pages,
     fetch_last_posts,
+    run_full_diagnostics,
     test_page_token,
 )
+from safe_log import get_logger, log_file_path, setup_logging
+
+setup_logging()
+log = get_logger()
 
 
 class MaskedEntry(ttk.Frame):
@@ -79,6 +88,8 @@ class App(ttk.Frame):
         self.posts: list[PagePost] = []
         self._busy = False
         self._selected_page: FacebookPage | None = None
+        self._last_error_text = ""
+        self._last_report: DiagnosticReport | None = None
 
         self.grid(sticky="nsew")
         root.columnconfigure(0, weight=1)
@@ -86,30 +97,57 @@ class App(ttk.Frame):
         self.columnconfigure(0, weight=1)
 
         self._build_ui()
-        self._set_status("Ready.")
+        self._set_status(f"Ready. Log: {log_file_path()}")
+        log.info("GUI started Graph API %s", GRAPH_API_VERSION)
 
     # ------------------------------------------------------------------ UI
     def _build_ui(self) -> None:
+        # Scrollable outer area for smaller screens
+        canvas = tk.Canvas(self, highlightthickness=0)
+        vscroll = ttk.Scrollbar(self, orient="vertical", command=canvas.yview)
+        self._inner = ttk.Frame(canvas, padding=(0, 0, 8, 0))
+        self._inner.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all")),
+        )
+        self._canvas_window = canvas.create_window((0, 0), window=self._inner, anchor="nw")
+        canvas.configure(yscrollcommand=vscroll.set)
+        canvas.grid(row=0, column=0, sticky="nsew")
+        vscroll.grid(row=0, column=1, sticky="ns")
+        self.rowconfigure(0, weight=1)
+        self.columnconfigure(0, weight=1)
+
+        def _on_canvas_configure(event: tk.Event) -> None:  # type: ignore[name-defined]
+            canvas.itemconfigure(self._canvas_window, width=event.width)
+
+        canvas.bind("<Configure>", _on_canvas_configure)
+
+        parent = self._inner
+        parent.columnconfigure(0, weight=1)
         row = 0
 
-        title = ttk.Label(self, text="Meta Page Token Generator", style="Title.TLabel")
+        title = ttk.Label(parent, text="Meta Page Token Generator", style="Title.TLabel")
         title.grid(row=row, column=0, sticky="w")
         row += 1
 
         subtitle = ttk.Label(
-            self,
+            parent,
             text="Convert a Meta User Access Token to a long-lived token and retrieve Page Access Tokens.",
             wraplength=860,
         )
         subtitle.grid(row=row, column=0, sticky="w", pady=(2, 4))
         row += 1
 
-        api_lbl = ttk.Label(self, text=f"Graph API: {GRAPH_API_VERSION}", style="Muted.TLabel")
+        api_lbl = ttk.Label(
+            parent,
+            text=f"Graph API: {GRAPH_API_VERSION}  ·  Debug log: logs/meta_token_generator.log",
+            style="Muted.TLabel",
+        )
         api_lbl.grid(row=row, column=0, sticky="w", pady=(0, 8))
         row += 1
 
         # Credentials
-        cred = ttk.LabelFrame(self, text="Meta Credentials", padding=10)
+        cred = ttk.LabelFrame(parent, text="Meta Credentials", padding=10)
         cred.grid(row=row, column=0, sticky="ew", pady=(0, 8))
         cred.columnconfigure(1, weight=1)
         row += 1
@@ -134,7 +172,10 @@ class App(ttk.Frame):
             command=self.on_generate,
         )
         self.generate_btn.pack(side="left")
+        self.diag_btn = ttk.Button(btn_row, text="Run Diagnostics", command=self.on_run_diagnostics)
+        self.diag_btn.pack(side="left", padx=(8, 0))
         ttk.Button(btn_row, text="Clear Sensitive Data", command=self.on_clear).pack(side="left", padx=(8, 0))
+        ttk.Button(btn_row, text="Open Log File", command=self.open_log_file).pack(side="left", padx=(8, 0))
 
         notice = ttk.Label(
             cred,
@@ -147,8 +188,26 @@ class App(ttk.Frame):
         )
         notice.grid(row=4, column=0, columnspan=2, sticky="w", pady=(8, 0))
 
+        # Diagnostics
+        diag = ttk.LabelFrame(parent, text="Diagnostics", padding=10)
+        diag.grid(row=row, column=0, sticky="nsew", pady=(0, 8))
+        diag.columnconfigure(0, weight=1)
+        diag.rowconfigure(0, weight=1)
+        parent.rowconfigure(row, weight=2)
+        row += 1
+
+        self.diag_text = scrolledtext.ScrolledText(diag, height=12, wrap="word", font=("Menlo", 11))
+        self.diag_text.grid(row=0, column=0, sticky="nsew")
+        self.diag_text.insert("1.0", "Click “Run Diagnostics” to test credentials step by step.\n")
+        self.diag_text.configure(state="disabled")
+
+        diag_btns = ttk.Frame(diag)
+        diag_btns.grid(row=1, column=0, sticky="w", pady=(6, 0))
+        ttk.Button(diag_btns, text="Copy Error Details", command=self.copy_error_details).pack(side="left")
+        ttk.Button(diag_btns, text="Copy Full Report", command=self.copy_full_report).pack(side="left", padx=(6, 0))
+
         # Long-lived token
-        ll = ttk.LabelFrame(self, text="Long-Lived User Access Token", padding=10)
+        ll = ttk.LabelFrame(parent, text="Long-Lived User Access Token", padding=10)
         ll.grid(row=row, column=0, sticky="ew", pady=(0, 8))
         ll.columnconfigure(0, weight=1)
         row += 1
@@ -166,11 +225,11 @@ class App(ttk.Frame):
         ttk.Button(ll_btns, text="Show / Hide", command=self.ll_token.toggle).pack(side="left", padx=(6, 0))
 
         # Pages
-        pages_frame = ttk.LabelFrame(self, text="Available Facebook Pages", padding=10)
+        pages_frame = ttk.LabelFrame(parent, text="Available Facebook Pages", padding=10)
         pages_frame.grid(row=row, column=0, sticky="nsew", pady=(0, 8))
         pages_frame.columnconfigure(0, weight=1)
         pages_frame.rowconfigure(0, weight=1)
-        self.rowconfigure(row, weight=2)
+        parent.rowconfigure(row, weight=2)
         row += 1
 
         cols = ("name", "id", "tasks")
@@ -178,7 +237,7 @@ class App(ttk.Frame):
             pages_frame,
             columns=cols,
             show="headings",
-            height=6,
+            height=5,
             selectmode="browse",
         )
         self.pages_tree.heading("name", text="Page Name")
@@ -194,7 +253,7 @@ class App(ttk.Frame):
         self.pages_tree.bind("<<TreeviewSelect>>", self.on_page_select)
 
         # Selected page
-        sel = ttk.LabelFrame(self, text="Selected Page", padding=10)
+        sel = ttk.LabelFrame(parent, text="Selected Page", padding=10)
         sel.grid(row=row, column=0, sticky="ew", pady=(0, 8))
         sel.columnconfigure(1, weight=1)
         row += 1
@@ -226,11 +285,11 @@ class App(ttk.Frame):
         self.test_result.grid(row=4, column=0, columnspan=2, sticky="w", pady=(8, 0))
 
         # Posts
-        posts_frame = ttk.LabelFrame(self, text="Last 3 Posts", padding=10)
+        posts_frame = ttk.LabelFrame(parent, text="Last 3 Posts", padding=10)
         posts_frame.grid(row=row, column=0, sticky="nsew", pady=(0, 8))
         posts_frame.columnconfigure(0, weight=1)
         posts_frame.rowconfigure(0, weight=1)
-        self.rowconfigure(row, weight=3)
+        parent.rowconfigure(row, weight=2)
         row += 1
 
         post_cols = ("id", "created", "message", "permalink", "picture", "attachments")
@@ -238,7 +297,7 @@ class App(ttk.Frame):
             posts_frame,
             columns=post_cols,
             show="headings",
-            height=5,
+            height=4,
             selectmode="browse",
         )
         headings = {
@@ -271,9 +330,9 @@ class App(ttk.Frame):
             command=self.open_selected_post,
         ).grid(row=1, column=0, sticky="w", pady=(6, 0))
 
-        # Status bar
+        # Status bar (fixed at bottom of outer frame)
         status = ttk.Frame(self)
-        status.grid(row=row, column=0, sticky="ew")
+        status.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
         status.columnconfigure(0, weight=1)
         self.status_var = tk.StringVar(value="")
         ttk.Label(status, textvariable=self.status_var).grid(row=0, column=0, sticky="w")
@@ -284,10 +343,17 @@ class App(ttk.Frame):
     def _set_status(self, text: str) -> None:
         self.status_var.set(text)
 
+    def _set_diag_text(self, text: str) -> None:
+        self.diag_text.configure(state="normal")
+        self.diag_text.delete("1.0", "end")
+        self.diag_text.insert("1.0", text)
+        self.diag_text.configure(state="disabled")
+
     def _set_busy(self, busy: bool, status: str | None = None) -> None:
         self._busy = busy
         state = "disabled" if busy else "normal"
         self.generate_btn.configure(state=state)
+        self.diag_btn.configure(state=state)
         self.test_btn.configure(state=state)
         self.posts_btn.configure(state=state)
         if busy:
@@ -324,8 +390,12 @@ class App(ttk.Frame):
             except MetaAPIError as exc:
                 err = exc
                 self.root.after(0, lambda: self._on_async_error(err, disabled))
-            except Exception as exc:  # noqa: BLE001 — surface unexpected errors in GUI
-                err = MetaAPIError(f"Unexpected error: {exc.__class__.__name__}: {exc}")
+            except Exception as exc:  # noqa: BLE001
+                log.exception("Unexpected GUI worker error")
+                err = MetaAPIError(
+                    f"Unexpected error: {exc.__class__.__name__}: {exc}",
+                    operation="UNEXPECTED",
+                )
                 self.root.after(0, lambda: self._on_async_error(err, disabled))
             else:
                 self.root.after(0, lambda: self._on_async_ok(result, on_success, disabled))
@@ -346,9 +416,36 @@ class App(ttk.Frame):
     def _on_async_error(self, exc: MetaAPIError, disabled: list[ttk.Button]) -> None:
         for b in disabled:
             b.configure(state="normal")
-        self._set_busy(False, "Error.")
+        self._set_busy(False, "Error — see Diagnostics / log.")
         self.test_result.configure(text="", fg="")
-        messagebox.showerror("Meta API Error", exc.format_for_user())
+        self._last_error_text = exc.format_for_user()
+        self._set_diag_text(self._last_error_text + "\n\n" + (self._last_report.full_report_text() if self._last_report else ""))
+        self._show_error_dialog(exc)
+
+    def _show_error_dialog(self, exc: MetaAPIError) -> None:
+        win = tk.Toplevel(self.root)
+        win.title("Meta API Error")
+        win.transient(self.root)
+        win.grab_set()
+        win.geometry("520x420")
+        win.minsize(420, 320)
+
+        body = scrolledtext.ScrolledText(win, wrap="word", font=("Menlo", 11))
+        body.pack(fill="both", expand=True, padx=12, pady=12)
+        body.insert("1.0", exc.format_for_user())
+        body.configure(state="disabled")
+
+        btns = ttk.Frame(win)
+        btns.pack(fill="x", padx=12, pady=(0, 12))
+
+        def copy_details() -> None:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(exc.safe_details_for_clipboard())
+            self._set_status("Copied error details (no secrets).")
+
+        ttk.Button(btns, text="Copy Error Details", command=copy_details).pack(side="left")
+        ttk.Button(btns, text="Open Log File", command=self.open_log_file).pack(side="left", padx=(8, 0))
+        ttk.Button(btns, text="Close", command=win.destroy).pack(side="right")
 
     def _copy_text(self, value: str, label: str) -> None:
         if not value:
@@ -363,6 +460,37 @@ class App(ttk.Frame):
         widget.set(value)
         widget.set_masked(True)
         widget.entry.configure(state="readonly")
+
+    def open_log_file(self) -> None:
+        path = log_file_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if not path.exists():
+            path.write_text("Log file created.\n", encoding="utf-8")
+        try:
+            if sys.platform == "darwin":
+                subprocess.run(["open", str(path)], check=False)
+            elif sys.platform == "win32":
+                os.startfile(str(path))  # type: ignore[attr-defined]
+            else:
+                subprocess.run(["xdg-open", str(path)], check=False)
+            self._set_status(f"Opened log: {path}")
+        except OSError as exc:
+            messagebox.showerror("Open Log File", f"Could not open log file:\n{path}\n\n{exc}")
+
+    def copy_error_details(self) -> None:
+        text = self._last_error_text or "No error details yet. Run Generate or Diagnostics first."
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+        self._set_status("Copied error details (no secrets).")
+
+    def copy_full_report(self) -> None:
+        if self._last_report:
+            text = self._last_report.full_report_text()
+        else:
+            text = self.diag_text.get("1.0", "end").strip() or "No report yet."
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+        self._set_status("Copied diagnostic report (no secrets).")
 
     # -------------------------------------------------------------- actions
     def on_generate(self) -> None:
@@ -401,35 +529,99 @@ class App(ttk.Frame):
             self._set_readonly_entry(self.ll_token, exchanged.access_token)
             self._populate_pages(pages)
 
+            summary = (
+                f"[✓] Input validation\n"
+                f"[✓] User token valid\n"
+                f"[✓] Long-lived token exchange\n"
+                f"[✓] Long-lived token validated\n"
+            )
             if pages_error:
+                summary += f"[✗] /me/accounts\n\n{pages_error}"
                 self._set_status("Long-lived token OK — Page list failed.")
+                self._set_diag_text(summary)
                 messagebox.showwarning(
                     "Pages not loaded",
                     "Long-lived User Access Token was generated and is shown above.\n\n"
-                    "Listing Facebook Pages failed:\n\n"
-                    + pages_error
-                    + "\n\nAdd pages_show_list to the User Token and try again, "
-                    "or use Graph API Explorer with Pages selected.",
+                    "Listing Facebook Pages failed — see Diagnostics / log.",
                 )
             elif not pages:
+                summary += "[✗] /me/accounts returned 0 pages"
                 self._set_status("Long-lived token OK — no Pages returned.")
+                self._set_diag_text(summary)
                 messagebox.showwarning(
                     "No Pages found",
-                    "Long-lived User Access Token was generated.\n\n"
-                    "Meta returned no Pages for /me/accounts.\n\n"
-                    "Check:\n"
-                    "• Permission pages_show_list\n"
-                    "• You are admin/editor of at least one Page\n"
-                    "• In Graph API Explorer, select the Pages you manage when creating the token",
+                    "Long-lived User Access Token was generated, but Meta returned no Pages.",
                 )
             else:
+                summary += f"[✓] /me/accounts — pages_count={len(pages)}"
+                self._set_diag_text(summary)
                 self._set_status(f"Loaded {len(pages)} Facebook Page(s).")
 
         self._run_async(
             work,
             ok,
             busy_message="Contacting Meta Graph API...",
-            buttons=(self.generate_btn,),
+            buttons=(self.generate_btn, self.diag_btn),
+        )
+
+    def on_run_diagnostics(self) -> None:
+        app_id = self.app_id_var.get().strip()
+        app_secret = self.app_secret.get().strip()
+        user_token = self.user_token.get().strip()
+
+        self._set_diag_text("Running diagnostics…\n")
+
+        def work() -> DiagnosticReport:
+            return run_full_diagnostics(app_id, app_secret, user_token)
+
+        def ok(result: object) -> None:
+            report = result  # type: ignore[misc]
+            assert isinstance(report, DiagnosticReport)
+            self._last_report = report
+            text = report.checklist_text() + "\n\n" + report.full_report_text()
+            self._set_diag_text(text)
+
+            if report.exchanged:
+                exchanged = report.exchanged
+                days = exchanged.approx_days
+                days_txt = f" (~{days} days)" if days is not None else ""
+                expires_txt = (
+                    f"expires_in={exchanged.expires_in}{days_txt}"
+                    if exchanged.expires_in is not None
+                    else "expires_in not provided by Meta"
+                )
+                self.ll_info.configure(
+                    text=(
+                        f"Long-lived User Access Token generated.\n"
+                        f"token_type: {exchanged.token_type}  ·  {expires_txt}"
+                    )
+                )
+                self._set_readonly_entry(self.ll_token, exchanged.access_token)
+
+            if report.pages:
+                self._populate_pages(report.pages)
+
+            if report.failed_step:
+                self._last_error_text = text
+                self._set_status(f"Diagnostics stopped at: {report.failed_step}")
+                messagebox.showwarning(
+                    "Diagnostics",
+                    f"Stopped at: {report.failed_step}\n\n"
+                    "See the Diagnostics panel and logs/meta_token_generator.log\n"
+                    "(secrets are redacted).",
+                )
+            else:
+                self._set_status(f"Diagnostics OK — {report.pages_count} page(s).")
+                messagebox.showinfo(
+                    "Diagnostics",
+                    f"All steps succeeded.\nPages found: {report.pages_count}",
+                )
+
+        self._run_async(
+            work,
+            ok,
+            busy_message="Running diagnostics against Meta Graph API...",
+            buttons=(self.generate_btn, self.diag_btn),
         )
 
     def _populate_pages(self, pages: list[FacebookPage]) -> None:
@@ -577,12 +769,14 @@ class App(ttk.Frame):
         self.pages = []
         self.pages_tree.delete(*self.pages_tree.get_children())
         self._clear_selection_ui()
+        self._last_error_text = ""
+        self._last_report = None
+        self._set_diag_text("Sensitive data cleared. Click “Run Diagnostics” when ready.\n")
         self._set_status("Sensitive data cleared.")
 
 
 def configure_styles(root: tk.Tk) -> None:
     style = ttk.Style(root)
-    # Prefer a native-looking theme on macOS when available.
     preferred = ("aqua", "clam", "alt", "default")
     for name in preferred:
         if name in style.theme_names():
@@ -595,8 +789,8 @@ def configure_styles(root: tk.Tk) -> None:
 def main() -> None:
     root = tk.Tk()
     root.title("Meta Page Token Generator")
-    root.geometry("900x700")
-    root.minsize(780, 600)
+    root.geometry("920x780")
+    root.minsize(800, 640)
     configure_styles(root)
     App(root)
     root.mainloop()

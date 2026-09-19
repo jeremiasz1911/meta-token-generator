@@ -62,6 +62,17 @@ Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
 ```
 
 Then run `.venv\Scripts\Activate.ps1` again.
+## Diagnostics / DEBUG MODE
+
+If token exchange fails while the same token works in Graph API Explorer:
+
+1. Fill App ID, App Secret, and User Access Token.
+2. Click **Run Diagnostics**.
+3. Read the **Diagnostics** panel (checklist + report).
+4. Click **Open Log File** → `logs/meta_token_generator.log`.
+
+Logs include HTTP status, sanitized params, and Meta JSON errors. **Full secrets are never written** (masked as `EAAB...9XYZ`).
+
 ## How to use
 
 1. Create a **Meta App** in [Meta for Developers](https://developers.facebook.com/).
