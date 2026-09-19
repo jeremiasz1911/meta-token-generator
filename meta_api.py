@@ -79,7 +79,14 @@ class MetaAPIError(Exception):
 
 @dataclass
 class TokenExchangeResult:
-    access_token: str
+    """Result of exchanging a short-lived User token for a long-lived User token.
+
+    IMPORTANT: ``long_lived_user_token`` is an *intermediate* token.
+    The WordPress / Facebook Page plugin must use ``FacebookPage.page_access_token``
+    from ``/me/accounts``, not this value.
+    """
+
+    long_lived_user_token: str
     token_type: str
     expires_in: int | None
 
@@ -94,12 +101,24 @@ class TokenExchangeResult:
 class FacebookPage:
     id: str
     name: str
-    access_token: str
+    # IMPORTANT:
+    # The plugin requires the Page Access Token returned by /me/accounts,
+    # not the long-lived User Access Token.
+    page_access_token: str
     tasks: list[str] = field(default_factory=list)
 
     def tasks_display(self) -> str:
         return ", ".join(self.tasks) if self.tasks else "—"
 
+
+WRONG_TOKEN_TYPE_MESSAGE = (
+    "WRONG TOKEN TYPE\n\n"
+    "Meta requires a Page Access Token.\n\n"
+    "The application attempted to access published_posts\n"
+    "using a token that Meta does not recognize as a Page Access Token.\n\n"
+    "Do not use the Long-Lived User Access Token here.\n"
+    "Use data[].access_token returned by /me/accounts."
+)
 
 @dataclass
 class PagePost:
@@ -616,7 +635,7 @@ def exchange_user_token(
         ) from exc
 
     return TokenExchangeResult(
-        access_token=token,
+        long_lived_user_token=token,
         token_type=token_type_out,
         expires_in=expires_in,
     )
@@ -671,15 +690,15 @@ def fetch_all_pages(
                 continue
             page_id = str(item.get("id") or "").strip()
             name = str(item.get("name") or "").strip() or "(unnamed)"
-            page_token = item.get("access_token")
+            page_access_token = item.get("access_token")
             if not page_id:
                 continue
             if include_access_token_field and (
-                not isinstance(page_token, str) or not page_token
+                not isinstance(page_access_token, str) or not page_access_token
             ):
                 continue
-            if not isinstance(page_token, str):
-                page_token = ""
+            if not isinstance(page_access_token, str):
+                page_access_token = ""
             tasks_raw = item.get("tasks") or []
             tasks: list[str] = []
             if isinstance(tasks_raw, list):
@@ -688,7 +707,7 @@ def fetch_all_pages(
                 FacebookPage(
                     id=page_id,
                     name=name,
-                    access_token=page_token,
+                    page_access_token=page_access_token,
                     tasks=tasks,
                 )
             )
@@ -832,12 +851,16 @@ def run_full_diagnostics(app_id: str, app_secret: str, user_token: str) -> Diagn
 
     # 5. Pages (without requiring page tokens for count — use fields with token for full data)
     try:
-        pages = fetch_all_pages(exchanged.access_token)
+        pages = fetch_all_pages(exchanged.long_lived_user_token)
         report.pages_ok = True
         report.pages_count = len(pages)
         report.pages = pages
         report.checks.append(
-            CheckResult("/me/accounts", True, f"pages_count={len(pages)}")
+            CheckResult(
+                "FACEBOOK PAGES — /me/accounts successful",
+                True,
+                f"{len(pages)} Pages found",
+            )
         )
     except MetaAPIError as exc:
         report.pages_ok = False
@@ -846,12 +869,61 @@ def run_full_diagnostics(app_id: str, app_secret: str, user_token: str) -> Diagn
         log.error("DIAG /me/accounts failed")
         return report
 
+    # 6. Validate first page token against published_posts (plugin critical path)
+    if pages:
+        sample = pages[0]
+        try:
+            verify_page_token_belongs(sample.id, sample.page_access_token)
+            report.checks.append(
+                CheckResult(
+                    f"PAGE ACCESS TOKEN — identifies Page {sample.name}",
+                    True,
+                    f"Page ID: {sample.id}",
+                )
+            )
+            posts = fetch_published_posts(sample.id, sample.page_access_token, limit=3)
+            report.checks.append(
+                CheckResult(
+                    "PUBLISHED POSTS — accessible",
+                    True,
+                    f"{len(posts)} posts retrieved (sample page)",
+                )
+            )
+            report.checks.append(
+                CheckResult("FINAL RESULT — PAGE ACCESS TOKEN READY FOR PLUGIN", True)
+            )
+        except MetaAPIError as exc:
+            report.failed_step = "published_posts"
+            report.checks.append(
+                CheckResult("PUBLISHED POSTS", False, exc.message)
+            )
+            log.error("DIAG published_posts failed on sample page")
+            return report
+
     log.info("=== RUN_DIAGNOSTICS complete OK pages=%s ===", report.pages_count)
     return report
 
 
+def _raise_if_wrong_token_type(exc: MetaAPIError) -> None:
+    """Re-raise code 210 / user-token-on-page-endpoint as a clear WRONG TOKEN TYPE error."""
+    msg = (exc.message or "").lower()
+    if exc.code == 210 or "page access token is required" in msg or (
+        exc.subcode == 2069032
+    ):
+        raise MetaAPIError(
+            WRONG_TOKEN_TYPE_MESSAGE,
+            code=exc.code,
+            subcode=exc.subcode,
+            error_type=exc.error_type,
+            http_status=exc.http_status,
+            operation=exc.operation or "PUBLISHED_POSTS",
+            endpoint=exc.endpoint,
+            response_body=exc.response_body,
+        ) from exc
+
+
 def test_page_token(page_id: str, page_access_token: str) -> tuple[str, str]:
-    """Validate a Page Access Token. Returns (id, name)."""
+    """Validate a Page Access Token via GET /PAGE_ID. Returns (id, name)."""
     page_id = page_id.strip()
     page_access_token = page_access_token.strip()
     if not page_id:
@@ -859,21 +931,43 @@ def test_page_token(page_id: str, page_access_token: str) -> tuple[str, str]:
     if not page_access_token:
         raise MetaAPIError("Page Access Token is required.", operation="TEST_PAGE")
 
-    payload = graph_request(
-        "GET",
-        f"/{page_id}",
-        params={
-            "fields": "id,name",
-            "access_token": page_access_token,
-        },
-        operation="TEST_PAGE",
-    )
+    try:
+        payload = graph_request(
+            "GET",
+            f"/{page_id}",
+            params={
+                "fields": "id,name",
+                "access_token": page_access_token,
+            },
+            operation="TEST_PAGE",
+        )
+    except MetaAPIError as exc:
+        _raise_if_wrong_token_type(exc)
+        raise
 
     pid = str(payload.get("id") or "")
     name = str(payload.get("name") or "")
     if not pid:
         raise MetaAPIError("Page test returned no id.", operation="TEST_PAGE")
     return pid, name
+
+
+def verify_page_token_belongs(page_id: str, page_access_token: str) -> tuple[str, str]:
+    """
+    Confirm ``page_access_token`` identifies ``page_id``.
+
+    Returns (returned_id, name). Raises if IDs do not match.
+    """
+    returned_id, name = test_page_token(page_id, page_access_token)
+    if returned_id != page_id.strip():
+        raise MetaAPIError(
+            f"Page token does not belong to the selected Page.\n"
+            f"Selected Page ID: {page_id}\n"
+            f"Token returned ID: {returned_id}",
+            operation="VERIFY_PAGE_TOKEN",
+        )
+    log.info("Page token belongs to selected Page id=%s name=%s", returned_id, name)
+    return returned_id, name
 
 
 def _summarize_attachments(attachments: Any) -> str:
@@ -905,33 +999,51 @@ def _summarize_attachments(attachments: Any) -> str:
     return "; ".join(parts) if parts else "—"
 
 
-def fetch_last_posts(page_id: str, page_access_token: str, limit: int = 3) -> list[PagePost]:
-    """Load the latest posts for a Page."""
+def fetch_published_posts(
+    page_id: str,
+    page_access_token: str,
+    limit: int = 3,
+) -> list[PagePost]:
+    """
+    Load posts via ``GET /PAGE_ID/published_posts`` using a Page Access Token only.
+
+    Must never be called with a User / long-lived User token.
+    """
     page_id = page_id.strip()
     page_access_token = page_access_token.strip()
     if not page_id:
-        raise MetaAPIError("Page ID is required.", operation="GET_POSTS")
+        raise MetaAPIError("Page ID is required.", operation="PUBLISHED_POSTS")
     if not page_access_token:
-        raise MetaAPIError("Page Access Token is required.", operation="GET_POSTS")
+        raise MetaAPIError("Page Access Token is required.", operation="PUBLISHED_POSTS")
 
-    payload = graph_request(
-        "GET",
-        f"/{page_id}/posts",
-        params={
-            "fields": "id,message,created_time,permalink_url,full_picture,attachments{media,type,url}",
-            "limit": max(1, min(int(limit), 10)),
-            "access_token": page_access_token,
-        },
-        operation="GET_POSTS",
+    log.info(
+        "PUBLISHED_POSTS using page_access_token=%s (not user token) page_id=%s",
+        mask_secret(page_access_token),
+        page_id,
     )
+
+    try:
+        payload = graph_request(
+            "GET",
+            f"/{page_id}/published_posts",
+            params={
+                "fields": "id,created_time,message,full_picture,permalink_url",
+                "limit": max(1, min(int(limit), 10)),
+                "access_token": page_access_token,
+            },
+            operation="PUBLISHED_POSTS",
+        )
+    except MetaAPIError as exc:
+        _raise_if_wrong_token_type(exc)
+        raise
 
     data = payload.get("data")
     if data is None:
         data = []
     if not isinstance(data, list):
         raise MetaAPIError(
-            "Unexpected /posts response (data is not a list).",
-            operation="GET_POSTS",
+            "Unexpected /published_posts response (data is not a list).",
+            operation="PUBLISHED_POSTS",
         )
 
     posts: list[PagePost] = []
@@ -945,8 +1057,14 @@ def fetch_last_posts(page_id: str, page_access_token: str, limit: int = 3) -> li
                 created_time=str(item.get("created_time") or "—"),
                 permalink_url=str(item.get("permalink_url") or ""),
                 full_picture=str(item.get("full_picture") or ""),
-                attachments_summary=_summarize_attachments(item.get("attachments")),
+                attachments_summary="—",
             )
         )
 
+    log.info("PUBLISHED_POSTS OK count=%s page_id=%s", len(posts), page_id)
     return posts
+
+
+def fetch_last_posts(page_id: str, page_access_token: str, limit: int = 3) -> list[PagePost]:
+    """Alias: last posts via published_posts + Page Access Token."""
+    return fetch_published_posts(page_id, page_access_token, limit=limit)

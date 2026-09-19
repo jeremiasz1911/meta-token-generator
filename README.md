@@ -2,7 +2,11 @@
 
 Cross-platform desktop app (Python + Tkinter) for Facebook Page administrators — works on **macOS** and **Windows** (and Linux with Tk installed).
 
-It converts a short-lived **Meta User Access Token** into a **Long-Lived User Access Token**, lists your Facebook Pages via Graph API, and lets you copy a **Page Access Token** for a selected Page. You can also test the Page token and load the last 3 posts.
+It converts a short-lived **User Access Token** into a long-lived User token (*intermediate*),
+lists Facebook Pages via `/me/accounts`, and gives you the **Page Access Token** to paste into
+your WordPress Facebook Page plugin.
+
+**Do not** put the Long-Lived User Token into the plugin — Meta will return `(#210) A page access token is required`.
 
 This tool talks **only** to the official Meta Graph API (`graph.facebook.com`). It does not run a local web server, does not send analytics/telemetry, and does not save secrets to disk unless you copy them yourself.
 
@@ -82,13 +86,16 @@ Logs include HTTP status, sanitized params, and Meta JSON errors. **Full secrets
 5. Enter **Meta App ID**.
 6. Enter **Meta App Secret**.
 7. Enter the short-lived **User Access Token**.
-8. Click **Generate Long-Lived Token**.
+8. Click **Generate Long-Lived Token + Load Pages**.
 9. Select a Page under **Available Facebook Pages**.
-10. Copy the **Page Access Token** (and/or Page ID).
-11. Click **Test Page Token** to verify.
-12. Optionally click **Load Last 3 Posts**, then **Open Post in Browser**.
+10. In **FINAL TOKEN FOR PLUGIN**, click **Copy Token** (this is the Page Access Token).
+11. Optionally **Test Token** / **Test Last 3 Posts** (`published_posts`).
+12. Paste into the plugin as: `PAGE_ID|PAGE_ACCESS_TOKEN`.
 
-### Permissions
+### Token naming
+
+- **Long-Lived User Access Token** — intermediate only (used to call `/me/accounts`).
+- **Page Access Token** — from `/me/accounts` → `data[].access_token` — **this goes into the plugin**.
 
 Grant permissions legally through Meta’s normal flows (App Review / Business Verification when required). This app does not bypass Meta’s permission system.
 
